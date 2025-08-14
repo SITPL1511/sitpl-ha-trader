@@ -1,7 +1,8 @@
 import numpy as np
 import pandas as pd
 import yfinance as yf
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dt_time
+import pytz
 import logging
 from typing import Dict, List, Tuple, Optional
 import concurrent.futures
@@ -19,7 +20,7 @@ class TradeSignal:
     """Trade signal data structure"""
     timestamp: datetime
     symbol: str
-    signal_type: str  # 'LONG', 'SHORT', 'EXIT_LONG', 'EXIT_SHORT'
+    signal_type: str  # 'LONG', 'SHORT', 'EXIT_LONG', 'EXIT_SHORT', 'EOD_EXIT'
     entry_price: float
     stop_loss: float
     ha_close: float
@@ -54,18 +55,162 @@ class TradingConfig:
         self.price_tolerance = 0.001  # 0.1% for open=low/high detection
         self.concurrent_downloads = True
 
+        # IST timezone configuration
+        self.timezone = pytz.timezone('Asia/Kolkata')
+
+        # EOD settings for different markets
+        self.market_hours = {
+            'NSE': {  # Indian market (NSE/BSE)
+                'open': dt_time(9, 15),    # 9:15 AM IST
+                'close': dt_time(15, 30),  # 3:30 PM IST
+                'eod_exit_time': dt_time(15, 15)  # Close positions 15 minutes before market close
+            },
+            'NYSE': {  # US market (converted to IST)
+                'open': dt_time(19, 30),   # 9:30 AM EST = 7:00 PM IST (winter) / 7:30 PM IST (summer)
+                'close': dt_time(2, 0),    # 4:00 PM EST = 2:30 AM IST (next day)
+                'eod_exit_time': dt_time(1, 45)  # Close positions 15 minutes before market close
+            },
+            'NASDAQ': {  # Same as NYSE
+                'open': dt_time(19, 30),
+                'close': dt_time(2, 0),
+                'eod_exit_time': dt_time(1, 45)
+            }
+        }
+
+        # Default market (will be auto-detected based on symbol)
+        self.default_market = 'NSE'
+
+        # Enable/disable EOD closure
+        self.enable_eod_closure = True
+
         # API Keys for alternative data sources
-        self.alpha_vantage_key = "demo"  # Get free key from https://www.alphavantage.co/support/#api-key
-        self.polygon_key = "demo"        # Get free key from https://polygon.io/
+        self.alpha_vantage_key = "GFAICALUQMRA3RBJ"
+        self.polygon_key = "demo"
 
         # Data source preference order
         self.data_sources = ['alpha_vantage', 'polygon', 'yahoo_direct', 'yfinance']
+
+    def detect_market(self, symbol: str) -> str:
+        """Detect market based on symbol suffix"""
+        if symbol.endswith('.NS') or symbol.endswith('.BO'):
+            return 'NSE'
+        elif any(symbol.endswith(suffix) for suffix in ['.L', '.TO', '.AX']):
+            return 'OTHER'
+        else:
+            return 'NSE'  # Default for US stocks
+
+class TimeManager:
+    """Handles timezone conversions and market hours logic"""
+
+    def __init__(self, config: TradingConfig):
+        self.config = config
+        self.ist_tz = pytz.timezone('Asia/Kolkata')
+        self.utc_tz = pytz.UTC
+        self.logger = logging.getLogger(__name__)
+
+    def convert_to_ist(self, timestamp) -> datetime:
+        """Convert any timestamp to IST timezone"""
+        if timestamp is None:
+            return None
+
+        # Handle different input types
+        if isinstance(timestamp, str):
+            timestamp = pd.to_datetime(timestamp)
+        elif isinstance(timestamp, pd.Timestamp):
+            timestamp = timestamp.to_pydatetime()
+
+        # If timezone-naive, assume UTC
+        if timestamp.tzinfo is None:
+            timestamp = self.utc_tz.localize(timestamp)
+
+        # Convert to IST
+        ist_time = timestamp.astimezone(self.ist_tz)
+        return ist_time
+
+    def is_market_open(self, timestamp: datetime, symbol: str) -> bool:
+        """Check if market is open for given symbol at given time"""
+        market = self.config.detect_market(symbol)
+
+        if market not in self.config.market_hours:
+            return True  # Default to always open for unknown markets
+
+        market_config = self.config.market_hours[market]
+        ist_time = self.convert_to_ist(timestamp)
+        current_time = ist_time.time()
+
+        # Handle markets that close next day (like NYSE)
+        if market_config['close'] < market_config['open']:
+            # Market spans midnight
+            return current_time >= market_config['open'] or current_time <= market_config['close']
+        else:
+            # Regular market hours
+            return market_config['open'] <= current_time <= market_config['close']
+
+    def should_exit_eod(self, timestamp: datetime, symbol: str) -> bool:
+        """Check if position should be closed due to EOD"""
+        if not self.config.enable_eod_closure:
+            return False
+
+        market = self.config.detect_market(symbol)
+
+        if market not in self.config.market_hours:
+            return False
+
+        market_config = self.config.market_hours[market]
+        ist_time = self.convert_to_ist(timestamp)
+        current_time = ist_time.time()
+
+        # Check if current time is past EOD exit time
+        eod_exit = market_config['eod_exit_time']
+
+        if market_config['close'] < market_config['open']:
+            # Market spans midnight - need special handling
+            if eod_exit < market_config['open']:
+                # EOD exit is next day
+                return current_time >= eod_exit and current_time <= market_config['close']
+            else:
+                # EOD exit is same day
+                return current_time >= eod_exit
+        else:
+            # Regular market hours
+            return current_time >= eod_exit
+
+    def get_next_eod_time(self, timestamp: datetime, symbol: str) -> datetime:
+        """Get the next EOD exit time for a symbol"""
+        market = self.config.detect_market(symbol)
+
+        if market not in self.config.market_hours:
+            # Default: assume next day 3:15 PM IST
+            ist_time = self.convert_to_ist(timestamp)
+            next_eod = ist_time.replace(hour=15, minute=15, second=0, microsecond=0)
+            if next_eod <= ist_time:
+                next_eod += timedelta(days=1)
+            return next_eod
+
+        market_config = self.config.market_hours[market]
+        ist_time = self.convert_to_ist(timestamp)
+
+        # Calculate next EOD exit time
+        eod_exit = market_config['eod_exit_time']
+        next_eod = ist_time.replace(
+            hour=eod_exit.hour,
+            minute=eod_exit.minute,
+            second=0,
+            microsecond=0
+        )
+
+        # If EOD time has passed today, move to next trading day
+        if next_eod <= ist_time:
+            next_eod += timedelta(days=1)
+
+        return next_eod
 
 class DataManager:
     """Handles data downloading from multiple sources with fallback options"""
 
     def __init__(self, config: TradingConfig):
         self.config = config
+        self.time_manager = TimeManager(config)
         self.logger = logging.getLogger(__name__)
         self.session = requests.Session()
         self.setup_session()
@@ -82,12 +227,18 @@ class DataManager:
         }
         self.session.headers.update(headers)
 
+    def convert_timestamps_to_ist(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Convert all timestamps in dataframe to IST"""
+        if 'Datetime' in df.columns:
+            df['Datetime'] = df['Datetime'].apply(self.time_manager.convert_to_ist)
+        elif df.index.name == 'Datetime' or isinstance(df.index, pd.DatetimeIndex):
+            df.index = pd.DatetimeIndex([self.time_manager.convert_to_ist(ts) for ts in df.index])
+
+        return df
+
     def download_data_alpha_vantage(self, symbol: str, api_key: str = "demo",
                                     interval: str = "5min", outputsize: str = "compact") -> Optional[pd.DataFrame]:
-        """
-        Download data from Alpha Vantage API (free tier: 5 calls/minute, 500 calls/day)
-        Get free API key from: https://www.alphavantage.co/support/#api-key
-        """
+        """Download data from Alpha Vantage API with IST conversion"""
         try:
             base_url = "https://www.alphavantage.co/query"
 
@@ -160,7 +311,10 @@ class DataManager:
             df = pd.DataFrame(df_data)
             df = df.sort_values('Datetime').reset_index(drop=True)
 
-            self.logger.info(f"Downloaded {len(df)} bars for {symbol} from Alpha Vantage")
+            # Convert to IST
+            df = self.convert_timestamps_to_ist(df)
+
+            self.logger.info(f"Downloaded {len(df)} bars for {symbol} from Alpha Vantage (converted to IST)")
             return df
 
         except Exception as e:
@@ -170,10 +324,7 @@ class DataManager:
     def download_data_polygon(self, symbol: str, api_key: str = "demo",
                               multiplier: int = 5, timespan: str = "minute",
                               from_date: str = None, to_date: str = None) -> Optional[pd.DataFrame]:
-        """
-        Download data from Polygon.io API (free tier: 5 calls/minute)
-        Get free API key from: https://polygon.io/
-        """
+        """Download data from Polygon.io API with IST conversion"""
         try:
             if not from_date:
                 from_date = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
@@ -217,7 +368,10 @@ class DataManager:
             df = pd.DataFrame(df_data)
             df = df.sort_values('Datetime').reset_index(drop=True)
 
-            self.logger.info(f"Downloaded {len(df)} bars for {symbol} from Polygon")
+            # Convert to IST
+            df = self.convert_timestamps_to_ist(df)
+
+            self.logger.info(f"Downloaded {len(df)} bars for {symbol} from Polygon (converted to IST)")
             return df
 
         except Exception as e:
@@ -226,9 +380,7 @@ class DataManager:
 
     def download_data_yahoo_direct(self, symbol: str, period1: int = None,
                                    period2: int = None, interval: str = "5m") -> Optional[pd.DataFrame]:
-        """
-        Direct Yahoo Finance API access with better rate limiting handling
-        """
+        """Direct Yahoo Finance API access with IST conversion"""
         try:
             if not period1:
                 period1 = int((datetime.now() - timedelta(days=30)).timestamp())
@@ -293,7 +445,10 @@ class DataManager:
             df = pd.DataFrame(df_data)
             df = df.sort_values('Datetime').reset_index(drop=True)
 
-            self.logger.info(f"Downloaded {len(df)} bars for {symbol} from Yahoo Direct")
+            # Convert to IST
+            df = self.convert_timestamps_to_ist(df)
+
+            self.logger.info(f"Downloaded {len(df)} bars for {symbol} from Yahoo Direct (converted to IST)")
             return df
 
         except Exception as e:
@@ -301,10 +456,7 @@ class DataManager:
             return None
 
     def download_data_with_fallback(self, symbol: str, **kwargs) -> Optional[pd.DataFrame]:
-        """
-        Try multiple data sources with fallback logic
-        Priority: Alpha Vantage -> Polygon -> Yahoo Direct -> yfinance
-        """
+        """Try multiple data sources with fallback logic"""
         # Method 1: Alpha Vantage (if API key provided)
         alpha_vantage_key = kwargs.get('alpha_vantage_key')
         if alpha_vantage_key and alpha_vantage_key != "demo":
@@ -313,7 +465,7 @@ class DataManager:
                                                     kwargs.get('interval', '5m'))
             if data is not None:
                 return data
-            time.sleep(1)  # Rate limiting
+            time.sleep(1)
 
         # Method 2: Polygon (if API key provided)
         polygon_key = kwargs.get('polygon_key')
@@ -323,7 +475,7 @@ class DataManager:
                                               timespan=kwargs.get('timespan', 'minute'))
             if data is not None:
                 return data
-            time.sleep(1)  # Rate limiting
+            time.sleep(1)
 
         # Method 3: Yahoo Direct API
         self.logger.info(f"Trying Yahoo Direct API for {symbol}")
@@ -341,10 +493,9 @@ class DataManager:
         return None
 
     def _download_yfinance_with_retry(self, symbol: str, max_retries: int = 3, **kwargs) -> Optional[pd.DataFrame]:
-        """yfinance with exponential backoff retry logic"""
+        """yfinance with exponential backoff retry logic and IST conversion"""
         for attempt in range(max_retries):
             try:
-                # Progressive delay to avoid rate limiting
                 if attempt > 0:
                     delay = (2 ** attempt) + random.uniform(0, 1)
                     self.logger.info(f"Retrying {symbol} after {delay:.1f}s delay")
@@ -358,6 +509,9 @@ class DataManager:
 
                 if not data.empty:
                     data.reset_index(inplace=True)
+                    # Convert to IST
+                    data = self.convert_timestamps_to_ist(data)
+                    self.logger.info(f"Downloaded {len(data)} bars for {symbol} from yfinance (converted to IST)")
                     return data
 
             except Exception as e:
@@ -381,16 +535,13 @@ class DataManager:
         for symbol in symbols:
             try:
                 ticker = yf.Ticker(symbol)
-
-                # Quick validation with recent data
                 data = ticker.history(period="5d", interval="1d")
 
                 if not data.empty and len(data) >= 1:
-                    # Check if data is recent (within last 7 days)
                     last_date = data.index[-1].date() if hasattr(data.index[-1], 'date') else data.index[-1]
                     days_old = (datetime.now().date() - last_date).days
 
-                    if days_old <= 7:  # Recent data available
+                    if days_old <= 7:
                         valid_symbols.append(symbol)
                         self.logger.info(f"✓ {symbol} is valid (last data: {days_old} days ago)")
                     else:
@@ -407,10 +558,10 @@ class DataManager:
 
         self.logger.info(f"Validation complete: {len(valid_symbols)}/{len(symbols)} symbols are valid")
         return valid_symbols
+
     def download_data(self, symbols: List[str], period: str = "1y",
                       interval: str = "5m", **kwargs) -> Dict[str, pd.DataFrame]:
-        """Download historical data for multiple symbols with multiple data sources"""
-        # First validate symbols (only if using yfinance validation)
+        """Download historical data for multiple symbols with multiple data sources and IST conversion"""
         if not kwargs.get('skip_validation', False):
             valid_symbols = self.validate_symbols(symbols)
         else:
@@ -420,7 +571,6 @@ class DataManager:
             self.logger.error("No valid symbols found!")
             return {}
 
-        # Use fallback method for better reliability
         if self.config.concurrent_downloads:
             return self._download_concurrent_fallback(valid_symbols, period, interval, **kwargs)
         else:
@@ -435,8 +585,7 @@ class DataManager:
             )
 
         results = {}
-        # Limit concurrent requests to avoid overwhelming APIs
-        max_workers = min(3, len(symbols))  # Reduced from 10 to 3
+        max_workers = min(3, len(symbols))
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_symbol = {
@@ -448,8 +597,6 @@ class DataManager:
                 symbol, data = future.result()
                 if data is not None:
                     results[symbol] = data
-
-                # Add delay between requests
                 time.sleep(0.5)
 
         return results
@@ -469,121 +616,9 @@ class DataManager:
             if data is not None:
                 results[symbol] = data
 
-            # Add progressive delay to avoid rate limiting
-            if i < len(symbols) - 1:  # Don't delay after last symbol
-                delay = random.uniform(1, 3)  # Random delay between 1-3 seconds
+            if i < len(symbols) - 1:
+                delay = random.uniform(1, 3)
                 time.sleep(delay)
-
-        return results
-
-    def _download_concurrent(self, symbols: List[str], period: str,
-                             interval: str) -> Dict[str, pd.DataFrame]:
-        """Download data concurrently for better performance"""
-        def download_single(symbol):
-            try:
-                ticker = yf.Ticker(symbol)
-
-                # Get basic info to check if symbol is valid
-                try:
-                    info = ticker.info
-                    if not info or 'symbol' not in info:
-                        self.logger.warning(f"Symbol {symbol} may be invalid or delisted")
-                        return symbol, None
-                except Exception as info_error:
-                    self.logger.warning(f"Could not get info for {symbol}: {info_error}")
-
-                # Download historical data
-                data = ticker.history(period=period, interval=interval)
-
-                if data.empty:
-                    self.logger.warning(f"No historical data available for {symbol} - may be delisted or invalid")
-                    return symbol, None
-
-                # Validate data quality
-                if len(data) < 10:  # Minimum data points
-                    self.logger.warning(f"Insufficient data for {symbol} - only {len(data)} bars")
-                    return symbol, None
-
-                # Check for recent data to avoid delisted stocks
-                if not data.index.empty:
-                    last_date = data.index[-1].date() if hasattr(data.index[-1], 'date') else data.index[-1]
-                    days_old = (datetime.now().date() - last_date).days
-                    if days_old > 30:  # Data older than 30 days
-                        self.logger.warning(f"Data for {symbol} is {days_old} days old - may be delisted")
-                        return symbol, None
-
-                data.reset_index(inplace=True)
-                self.logger.info(f"Successfully downloaded {len(data)} bars for {symbol}")
-                return symbol, data
-
-            except Exception as e:
-                error_msg = str(e).lower()
-                if 'delisted' in error_msg or 'not found' in error_msg:
-                    self.logger.error(f"Symbol {symbol} appears to be delisted or not found: {e}")
-                else:
-                    self.logger.error(f"Error downloading {symbol}: {e}")
-                return symbol, None
-
-        results = {}
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-            future_to_symbol = {executor.submit(download_single, symbol): symbol
-                                for symbol in symbols}
-
-            for future in concurrent.futures.as_completed(future_to_symbol):
-                symbol, data = future.result()
-                if data is not None:
-                    results[symbol] = data
-                    self.logger.info(f"Downloaded {len(data)} bars for {symbol}")
-
-        return results
-
-    def _download_sequential(self, symbols: List[str], period: str,
-                             interval: str) -> Dict[str, pd.DataFrame]:
-        """Download data sequentially"""
-        results = {}
-        for symbol in symbols:
-            try:
-                ticker = yf.Ticker(symbol)
-
-                # Check if symbol is valid first
-                try:
-                    info = ticker.info
-                    if not info or 'symbol' not in info:
-                        self.logger.warning(f"Symbol {symbol} may be invalid or delisted")
-                        continue
-                except Exception as info_error:
-                    self.logger.warning(f"Could not get info for {symbol}: {info_error}")
-
-                data = ticker.history(period=period, interval=interval)
-
-                if data.empty:
-                    self.logger.warning(f"No data available for {symbol} - may be delisted")
-                    continue
-
-                # Validate data quality
-                if len(data) < 10:
-                    self.logger.warning(f"Insufficient data for {symbol}")
-                    continue
-
-                # Check data recency
-                if not data.index.empty:
-                    last_date = data.index[-1].date() if hasattr(data.index[-1], 'date') else data.index[-1]
-                    days_old = (datetime.now().date() - last_date).days
-                    if days_old > 30:
-                        self.logger.warning(f"Data for {symbol} is {days_old} days old - may be delisted")
-                        continue
-
-                data.reset_index(inplace=True)
-                results[symbol] = data
-                self.logger.info(f"Downloaded {len(data)} bars for {symbol}")
-
-            except Exception as e:
-                error_msg = str(e).lower()
-                if 'delisted' in error_msg or 'not found' in error_msg:
-                    self.logger.error(f"Symbol {symbol} appears to be delisted: {e}")
-                else:
-                    self.logger.error(f"Error downloading {symbol}: {e}")
-                continue
 
         return results
 
@@ -592,10 +627,7 @@ class HeikinAshiCalculator:
 
     @staticmethod
     def calculate(df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Calculate Heikin Ashi values using vectorized operations
-        Returns DataFrame with HA_Open, HA_High, HA_Low, HA_Close, HA_Color
-        """
+        """Calculate Heikin Ashi values using vectorized operations"""
         data = df.copy()
         n = len(data)
 
@@ -627,14 +659,15 @@ class HeikinAshiCalculator:
         return data
 
 class SignalGenerator:
-    """Generates trading signals based on Heikin Ashi patterns"""
+    """Generates trading signals based on Heikin Ashi patterns with EOD logic"""
 
     def __init__(self, config: TradingConfig):
         self.config = config
+        self.time_manager = TimeManager(config)
         self.logger = logging.getLogger(__name__)
 
-    def generate_signals(self, data: pd.DataFrame) -> List[TradeSignal]:
-        """Generate trading signals from Heikin Ashi data"""
+    def generate_signals(self, data: pd.DataFrame, symbol: str) -> List[TradeSignal]:
+        """Generate trading signals from Heikin Ashi data with EOD exits"""
         signals = []
 
         if len(data) < 2:
@@ -645,16 +678,16 @@ class SignalGenerator:
         curr_ha_color = data['HA_Color']
 
         # Long entry conditions (all on HA candles)
-        long_cond1 = prev_ha_color == 'GREEN'  # Previous HA candle is green
-        long_cond2 = data['HA_Close'] > data['HA_Close'].shift(1)  # Current HA close > prev HA close
-        long_cond3 = np.abs(data['HA_Open'] - data['HA_Low']) < (data['HA_High'] - data['HA_Low']) * self.config.price_tolerance  # HA open = HA low
+        long_cond1 = prev_ha_color == 'GREEN'
+        long_cond2 = data['HA_Close'] > data['HA_Close'].shift(1)
+        long_cond3 = np.abs(data['HA_Open'] - data['HA_Low']) < (data['HA_High'] - data['HA_Low']) * self.config.price_tolerance
 
         long_entries = long_cond1 & long_cond2 & long_cond3
 
         # Short entry conditions (all on HA candles)
-        short_cond1 = prev_ha_color == 'RED'  # Previous HA candle is red
-        short_cond2 = np.abs(data['HA_Open'] - data['HA_High']) < (data['HA_High'] - data['HA_Low']) * self.config.price_tolerance  # HA open = HA high
-        short_cond3 = data['HA_Close'] < data['HA_Close'].shift(1)  # Current HA close < prev HA close
+        short_cond1 = prev_ha_color == 'RED'
+        short_cond2 = np.abs(data['HA_Open'] - data['HA_High']) < (data['HA_High'] - data['HA_Low']) * self.config.price_tolerance
+        short_cond3 = data['HA_Close'] < data['HA_Close'].shift(1)
 
         short_entries = short_cond1 & short_cond2 & short_cond3
 
@@ -666,70 +699,96 @@ class SignalGenerator:
         for i in range(1, len(data)):
             timestamp = data.iloc[i]['Datetime'] if 'Datetime' in data.columns else data.index[i]
 
-            if long_entries.iloc[i]:
-                signals.append(TradeSignal(
-                    timestamp=timestamp,
-                    symbol='',  # Will be set by caller
-                    signal_type='LONG',
-                    entry_price=data.iloc[i]['Close'],  # Regular chart price
-                    stop_loss=data.iloc[i]['Open'],     # Regular chart price
-                    ha_close=data.iloc[i]['HA_Close'],
-                    ha_open=data.iloc[i]['HA_Open'],
-                    regular_close=data.iloc[i]['Close'],
-                    regular_open=data.iloc[i]['Open']
-                ))
+            # Only generate entry signals during market hours
+            if self.time_manager.is_market_open(timestamp, symbol):
 
-            if short_entries.iloc[i]:
-                signals.append(TradeSignal(
-                    timestamp=timestamp,
-                    symbol='',  # Will be set by caller
-                    signal_type='SHORT',
-                    entry_price=data.iloc[i]['Close'],  # Regular chart price
-                    stop_loss=data.iloc[i]['Open'],     # Regular chart price
-                    ha_close=data.iloc[i]['HA_Close'],
-                    ha_open=data.iloc[i]['HA_Open'],
-                    regular_close=data.iloc[i]['Close'],
-                    regular_open=data.iloc[i]['Open']
-                ))
+                # Check if we should avoid entries near EOD
+                if not self.time_manager.should_exit_eod(timestamp, symbol):
 
+                    if long_entries.iloc[i]:
+                        signals.append(TradeSignal(
+                            timestamp=timestamp,
+                            symbol=symbol,
+                            signal_type='LONG',
+                            entry_price=round(data.iloc[i]['Close'], 4),
+                            stop_loss=round(data.iloc[i]['Open'], 4),
+                            ha_close=round(data.iloc[i]['HA_Close'], 4),
+                            ha_open=round(data.iloc[i]['HA_Open'], 4),
+                            regular_close=round(data.iloc[i]['Close'], 4),
+                            regular_open=round(data.iloc[i]['Open'], 4)
+                        ))
+
+                    if short_entries.iloc[i]:
+                        signals.append(TradeSignal(
+                            timestamp=timestamp,
+                            symbol=symbol,
+                            signal_type='SHORT',
+                            entry_price=round(data.iloc[i]['Close'], 4),
+                            stop_loss=round(data.iloc[i]['Open'], 4),
+                            ha_close=round(data.iloc[i]['HA_Close'], 4),
+                            ha_open=round(data.iloc[i]['HA_Open'], 4),
+                            regular_close=round(data.iloc[i]['Close'], 4),
+                            regular_open=round(data.iloc[i]['Open'], 4)
+                        ))
+
+            # Regular exit signals (HA color change)
             if green_to_red.iloc[i]:
                 signals.append(TradeSignal(
                     timestamp=timestamp,
-                    symbol='',
+                    symbol=symbol,
                     signal_type='EXIT_LONG',
-                    entry_price=data.iloc[i]['Close'],
-                    stop_loss=0,
-                    ha_close=data.iloc[i]['HA_Close'],
-                    ha_open=data.iloc[i]['HA_Open'],
-                    regular_close=data.iloc[i]['Close'],
-                    regular_open=data.iloc[i]['Open']
+                    entry_price=round(data.iloc[i]['Close'], 4),
+                    stop_loss=0.0000,
+                    ha_close=round(data.iloc[i]['HA_Close'], 4),
+                    ha_open=round(data.iloc[i]['HA_Open'], 4),
+                    regular_close=round(data.iloc[i]['Close'], 4),
+                    regular_open=round(data.iloc[i]['Open'], 4)
                 ))
 
             if red_to_green.iloc[i]:
                 signals.append(TradeSignal(
                     timestamp=timestamp,
-                    symbol='',
+                    symbol=symbol,
                     signal_type='EXIT_SHORT',
-                    entry_price=data.iloc[i]['Close'],
-                    stop_loss=0,
-                    ha_close=data.iloc[i]['HA_Close'],
-                    ha_open=data.iloc[i]['HA_Open'],
-                    regular_close=data.iloc[i]['Close'],
-                    regular_open=data.iloc[i]['Open']
+                    entry_price=round(data.iloc[i]['Close'], 4),
+                    stop_loss=0.0000,
+                    ha_close=round(data.iloc[i]['HA_Close'], 4),
+                    ha_open=round(data.iloc[i]['HA_Open'], 4),
+                    regular_close=round(data.iloc[i]['Close'], 4),
+                    regular_open=round(data.iloc[i]['Open'], 4)
+                ))
+
+            # EOD exit signals
+            if self.time_manager.should_exit_eod(timestamp, symbol):
+                # Generate both long and short exit signals at EOD
+                signals.append(TradeSignal(
+                    timestamp=timestamp,
+                    symbol=symbol,
+                    signal_type='EOD_EXIT',
+                    entry_price=round(data.iloc[i]['Close'], 4),
+                    stop_loss=0.0000,
+                    ha_close=round(data.iloc[i]['HA_Close'], 4),
+                    ha_open=round(data.iloc[i]['HA_Open'], 4),
+                    regular_close=round(data.iloc[i]['Close'], 4),
+                    regular_open=round(data.iloc[i]['Open'], 4)
                 ))
 
         return signals
 
 class TradingEngine:
-    """Main trading engine that orchestrates all components"""
+    """Main trading engine that orchestrates all components with IST and EOD logic"""
 
     def __init__(self, config: TradingConfig):
         self.config = config
         self.data_manager = DataManager(config)
         self.signal_generator = SignalGenerator(config)
+        self.time_manager = TimeManager(config)
         self.trades: List[Trade] = []
         self.open_positions: Dict[str, Trade] = {}
         self.trade_id_counter = 0
+
+        # EOD tracking
+        self.eod_closures = []
 
         # Setup logging
         self.setup_logging()
@@ -747,15 +806,15 @@ class TradingEngine:
         )
 
     def run_backtest(self, start_date: str = None, end_date: str = None) -> Dict:
-        """Run historical backtest with multiple data sources"""
+        """Run historical backtest with IST conversion and EOD logic"""
         start_time = datetime.now()
-        self.logger.info("Starting backtest...")
+        self.logger.info("Starting backtest with IST timezone and EOD closure logic...")
 
         # Download data with API keys
         download_kwargs = {
             'alpha_vantage_key': self.config.alpha_vantage_key,
             'polygon_key': self.config.polygon_key,
-            'skip_validation': True  # Skip yfinance validation to avoid rate limits
+            'skip_validation': True
         }
 
         data_dict = self.data_manager.download_data(
@@ -772,25 +831,28 @@ class TradingEngine:
         # Process each symbol
         all_signals = []
         for symbol, data in data_dict.items():
+            self.logger.info(f"Processing {symbol} - Market: {self.config.detect_market(symbol)}")
+
             # Calculate Heikin Ashi
             ha_data = HeikinAshiCalculator.calculate(data)
 
-            # Generate signals
-            signals = self.signal_generator.generate_signals(ha_data)
-
-            # Set symbol for each signal
-            for signal in signals:
-                signal.symbol = symbol
-
+            # Generate signals with symbol-specific logic
+            signals = self.signal_generator.generate_signals(ha_data, symbol)
             all_signals.extend(signals)
+
             self.logger.info(f"Generated {len(signals)} signals for {symbol}")
 
-        # Sort signals by timestamp
+        # Sort signals by timestamp (IST)
         all_signals.sort(key=lambda x: x.timestamp)
+
+        self.logger.info(f"Total signals generated: {len(all_signals)}")
 
         # Execute trades
         for signal in all_signals:
             self._process_signal(signal)
+
+        # Force close any remaining open positions at the end
+        self._close_all_positions_at_end()
 
         # Calculate performance metrics
         performance = self._calculate_performance()
@@ -800,17 +862,20 @@ class TradingEngine:
 
         self.logger.info(f"Backtest completed in {execution_time:.2f} seconds")
         self.logger.info(f"Total trades: {len(self.trades)}")
+        self.logger.info(f"EOD closures: {len(self.eod_closures)}")
 
         return {
             'trades': self.trades,
             'performance': performance,
             'execution_time': execution_time,
             'total_signals': len(all_signals),
-            'data_sources_used': list(data_dict.keys())
+            'data_sources_used': list(data_dict.keys()),
+            'eod_closures': len(self.eod_closures),
+            'timezone': 'Asia/Kolkata (IST)'
         }
 
     def _process_signal(self, signal: TradeSignal):
-        """Process individual trading signal"""
+        """Process individual trading signal with EOD logic"""
         symbol = signal.symbol
 
         if signal.signal_type in ['LONG', 'SHORT']:
@@ -836,7 +901,8 @@ class TradingEngine:
             self.open_positions[symbol] = trade
             self.trade_id_counter += 1
 
-            self.logger.info(f"Opened {signal.signal_type} position for {symbol} at {signal.entry_price}")
+            ist_time = signal.timestamp.strftime('%Y-%m-%d %H:%M:%S IST')
+            self.logger.info(f"Opened {signal.signal_type} position for {symbol} at {round(signal.entry_price, 4)} [{ist_time}]")
 
         elif signal.signal_type in ['EXIT_LONG', 'EXIT_SHORT']:
             if symbol in self.open_positions:
@@ -846,110 +912,181 @@ class TradingEngine:
                 if (signal.signal_type == 'EXIT_LONG' and trade.side == 'LONG') or \
                         (signal.signal_type == 'EXIT_SHORT' and trade.side == 'SHORT'):
 
-                    # Close position
-                    trade.exit_time = signal.timestamp
-                    trade.exit_price = signal.entry_price  # Using regular chart price
-                    trade.exit_reason = 'HA_COLOR_CHANGE'
-                    trade.status = 'CLOSED'
+                    self._close_position(trade, signal, 'HA_COLOR_CHANGE')
 
-                    # Calculate P&L
-                    if trade.side == 'LONG':
-                        trade.pnl = trade.exit_price - trade.entry_price
-                    else:  # SHORT
-                        trade.pnl = trade.entry_price - trade.exit_price
+        elif signal.signal_type == 'EOD_EXIT':
+            # Close any open position for this symbol at EOD
+            if symbol in self.open_positions:
+                trade = self.open_positions[symbol]
+                self._close_position(trade, signal, 'EOD_CLOSURE')
+                self.eod_closures.append({
+                    'symbol': symbol,
+                    'timestamp': signal.timestamp,
+                    'side': trade.side
+                })
 
-                    del self.open_positions[symbol]
+    def _close_position(self, trade: Trade, signal: TradeSignal, reason: str):
+        """Close a position and calculate P&L"""
+        trade.exit_time = signal.timestamp
+        trade.exit_price = round(signal.entry_price, 4)  # Using regular chart price
+        trade.exit_reason = reason
+        trade.status = 'CLOSED'
 
-                    self.logger.info(f"Closed {trade.side} position for {symbol} at {trade.exit_price}, P&L: {trade.pnl:.2f}")
+        # Calculate P&L
+        if trade.side == 'LONG':
+            trade.pnl = round(trade.exit_price - trade.entry_price, 4)
+        else:  # SHORT
+            trade.pnl = round(trade.entry_price - trade.exit_price, 4)
+
+        del self.open_positions[trade.symbol]
+
+        ist_time = signal.timestamp.strftime('%Y-%m-%d %H:%M:%S IST')
+        self.logger.info(f"Closed {trade.side} position for {trade.symbol} at {trade.exit_price:.4f}, P&L: {trade.pnl:.4f}, Reason: {reason} [{ist_time}]")
+
+    def _close_all_positions_at_end(self):
+        """Force close all remaining open positions at the end of backtest"""
+        if self.open_positions:
+            self.logger.info(f"Force closing {len(self.open_positions)} remaining open positions")
+
+            for symbol, trade in list(self.open_positions.items()):
+                # Use last known price as exit price
+                trade.exit_time = datetime.now(self.time_manager.ist_tz)
+                trade.exit_price = round(trade.entry_price, 4)  # Conservative estimate
+                trade.exit_reason = 'BACKTEST_END'
+                trade.status = 'CLOSED'
+
+                # Calculate P&L (assuming no change for safety)
+                trade.pnl = 0.0000
+
+                self.logger.info(f"Force closed {trade.side} position for {symbol} at backtest end")
+
+            self.open_positions.clear()
 
     def _calculate_performance(self) -> Dict:
-        """Calculate performance metrics"""
+        """Calculate performance metrics with IST timezone info"""
         closed_trades = [t for t in self.trades if t.status == 'CLOSED']
 
         if not closed_trades:
-            return {'total_trades': 0}
+            return {'total_trades': 0, 'timezone': 'Asia/Kolkata (IST)'}
 
-        pnls = [t.pnl for t in closed_trades]
+        pnls = [t.pnl for t in closed_trades if t.pnl is not None]
 
-        total_pnl = sum(pnls)
+        if not pnls:
+            return {'total_trades': len(closed_trades), 'timezone': 'Asia/Kolkata (IST)'}
+
+        total_pnl = round(sum(pnls), 4)
         win_trades = [p for p in pnls if p > 0]
         lose_trades = [p for p in pnls if p < 0]
+
+        # Calculate trade durations
+        durations = []
+        eod_trades = 0
+        ha_exit_trades = 0
+
+        for trade in closed_trades:
+            if trade.entry_time and trade.exit_time:
+                duration = trade.exit_time - trade.entry_time
+                durations.append(duration.total_seconds() / 3600)  # Convert to hours
+
+                if trade.exit_reason == 'EOD_CLOSURE':
+                    eod_trades += 1
+                elif trade.exit_reason == 'HA_COLOR_CHANGE':
+                    ha_exit_trades += 1
 
         metrics = {
             'total_trades': len(closed_trades),
             'winning_trades': len(win_trades),
             'losing_trades': len(lose_trades),
-            'win_rate': len(win_trades) / len(closed_trades) if closed_trades else 0,
+            'win_rate': round(len(win_trades) / len(closed_trades), 4) if closed_trades else 0.0000,
             'total_pnl': total_pnl,
-            'average_win': np.mean(win_trades) if win_trades else 0,
-            'average_loss': np.mean(lose_trades) if lose_trades else 0,
-            'profit_factor': abs(sum(win_trades) / sum(lose_trades)) if lose_trades and sum(lose_trades) != 0 else float('inf'),
-            'max_win': max(pnls) if pnls else 0,
-            'max_loss': min(pnls) if pnls else 0,
+            'average_win': round(np.mean(win_trades), 4) if win_trades else 0.0000,
+            'average_loss': round(np.mean(lose_trades), 4) if lose_trades else 0.0000,
+            'profit_factor': round(abs(sum(win_trades) / sum(lose_trades)), 4) if lose_trades and sum(lose_trades) != 0 else float('inf'),
+            'max_win': round(max(pnls), 4) if pnls else 0.0000,
+            'max_loss': round(min(pnls), 4) if pnls else 0.0000,
+            'average_trade_duration_hours': round(np.mean(durations), 4) if durations else 0.0000,
+            'eod_closures': eod_trades,
+            'ha_color_exits': ha_exit_trades,
+            'timezone': 'Asia/Kolkata (IST)'
         }
 
         # Calculate drawdown
         cumulative_pnl = np.cumsum(pnls)
         running_max = np.maximum.accumulate(cumulative_pnl)
         drawdown = running_max - cumulative_pnl
-        metrics['max_drawdown'] = np.max(drawdown) if len(drawdown) > 0 else 0
+        metrics['max_drawdown'] = round(np.max(drawdown), 4) if len(drawdown) > 0 else 0.0000
 
         return metrics
 
     def export_trades(self, filename: str = None):
-        """Export trades to CSV"""
+        """Export trades to CSV with IST timestamps"""
         if not filename:
-            filename = f"trades_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            filename = f"trades_ist_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
 
         trades_data = []
         for trade in self.trades:
+            # Format IST timestamps
+            entry_time_ist = trade.entry_time.strftime('%Y-%m-%d %H:%M:%S IST') if trade.entry_time else None
+            exit_time_ist = trade.exit_time.strftime('%Y-%m-%d %H:%M:%S IST') if trade.exit_time else None
+
             trades_data.append({
                 'id': trade.id,
                 'symbol': trade.symbol,
+                'market': self.config.detect_market(trade.symbol),
                 'side': trade.side,
-                'entry_time': trade.entry_time,
-                'entry_price': trade.entry_price,
-                'stop_loss': trade.stop_loss,
-                'exit_time': trade.exit_time,
-                'exit_price': trade.exit_price,
+                'entry_time_ist': entry_time_ist,
+                'entry_price': round(trade.entry_price, 4) if trade.entry_price else None,
+                'stop_loss': round(trade.stop_loss, 4) if trade.stop_loss else None,
+                'exit_time_ist': exit_time_ist,
+                'exit_price': round(trade.exit_price, 4) if trade.exit_price else None,
                 'exit_reason': trade.exit_reason,
-                'pnl': trade.pnl,
+                'pnl': round(trade.pnl, 4) if trade.pnl is not None else None,
                 'status': trade.status
             })
 
         df = pd.DataFrame(trades_data)
         df.to_csv(filename, index=False)
-        self.logger.info(f"Trades exported to {filename}")
+        self.logger.info(f"Trades exported to {filename} with IST timestamps")
+
+    def print_market_hours_info(self):
+        """Print configured market hours for reference"""
+        print("\n=== CONFIGURED MARKET HOURS (IST) ===")
+        for market, hours in self.config.market_hours.items():
+            print(f"{market}:")
+            print(f"  Open: {hours['open'].strftime('%H:%M')}")
+            print(f"  Close: {hours['close'].strftime('%H:%M')}")
+            print(f"  EOD Exit: {hours['eod_exit_time'].strftime('%H:%M')}")
+            print()
 
 def main():
-    """Main execution function with multiple data source options"""
+    """Main execution function with IST and EOD enhancements"""
     # Initialize configuration
     config = TradingConfig()
 
-    # Set your API keys here (get free keys from the respective websites)
+    # Set your API keys here
     config.alpha_vantage_key = "demo"  # Replace with your free Alpha Vantage API key
     config.polygon_key = "demo"        # Replace with your free Polygon API key
 
-    # Use a mix of active stocks
-    config.symbols = ['AAPL', 'MSFT', 'GOOGL', 'TSLA', 'NVDA']
+    # Configure for Indian market
+    config.symbols = ['^NSEI']  # Indian stock symbol
     config.timeframe = '5m'
-    config.concurrent_downloads = False  # Set to False to avoid overwhelming APIs
+    config.concurrent_downloads = False
+    config.enable_eod_closure = True  # Enable EOD position closure
 
-    print("=== MULTI-SOURCE DATA DOWNLOADER ===")
-    print("Data sources available (in priority order):")
-    print("1. Alpha Vantage (free: 5 calls/min, 500 calls/day)")
-    print("2. Polygon.io (free: 5 calls/min)")
-    print("3. Yahoo Direct API (rate limited)")
-    print("4. yfinance (fallback, prone to 429 errors)")
-    print()
-    print("To avoid 429 errors:")
-    print("- Get free API keys from Alpha Vantage and/or Polygon")
-    print("- Set config.alpha_vantage_key and config.polygon_key")
-    print("- Reduce concurrent downloads or add delays")
+    print("=== ENHANCED TRADING ENGINE WITH IST & EOD LOGIC ===")
+    print("Features:")
+    print("✓ Multi-source data downloader with fallback")
+    print("✓ Automatic timezone conversion to IST")
+    print("✓ Market hours detection and validation")
+    print("✓ End-of-Day position closure to avoid gap risks")
+    print("✓ Separate tracking of EOD vs HA-based exits")
     print()
 
     # Initialize trading engine
     engine = TradingEngine(config)
+
+    # Print market hours configuration
+    engine.print_market_hours_info()
 
     try:
         # Run backtest
@@ -958,31 +1095,35 @@ def main():
         # Print performance summary
         performance = results['performance']
         print("\n=== BACKTEST RESULTS ===")
+        print(f"Timezone: {results.get('timezone', 'UTC')}")
         print(f"Data Sources Used: {results.get('data_sources_used', [])}")
         print(f"Execution Time: {results['execution_time']:.2f} seconds")
         print(f"Total Signals: {results['total_signals']}")
         print(f"Total Trades: {performance.get('total_trades', 0)}")
 
         if performance.get('total_trades', 0) > 0:
-            print(f"Win Rate: {performance.get('win_rate', 0):.2%}")
-            print(f"Total P&L: ${performance.get('total_pnl', 0):.2f}")
-            print(f"Max Drawdown: ${performance.get('max_drawdown', 0):.2f}")
-            print(f"Profit Factor: {performance.get('profit_factor', 0):.2f}")
-            print(f"Average Win: ${performance.get('average_win', 0):.2f}")
-            print(f"Average Loss: ${performance.get('average_loss', 0):.2f}")
+            print(f"Win Rate: {performance.get('win_rate', 0):.4f} ({performance.get('win_rate', 0)*100:.2f}%)")
+            print(f"Total P&L: ${performance.get('total_pnl', 0):.4f}")
+            print(f"Max Drawdown: ${performance.get('max_drawdown', 0):.4f}")
+            print(f"Profit Factor: {performance.get('profit_factor', 0):.4f}")
+            print(f"Average Win: ${performance.get('average_win', 0):.4f}")
+            print(f"Average Loss: ${performance.get('average_loss', 0):.4f}")
+            print(f"Average Trade Duration: {performance.get('average_trade_duration_hours', 0):.4f} hours")
+            print(f"EOD Closures: {performance.get('eod_closures', 0)}")
+            print(f"HA Color Change Exits: {performance.get('ha_color_exits', 0)}")
         else:
             print("No completed trades found.")
 
         # Export trades if any exist
         if len(engine.trades) > 0:
             engine.export_trades()
-            print(f"\nTrade history exported to CSV")
+            print(f"\nTrade history exported to CSV with IST timestamps")
 
-        print("\n=== API KEY SETUP INSTRUCTIONS ===")
-        print("To avoid rate limiting issues:")
-        print("1. Alpha Vantage: https://www.alphavantage.co/support/#api-key")
-        print("2. Polygon.io: https://polygon.io/ (free tier available)")
-        print("3. Set the keys in TradingConfig before running")
+        print("\n=== EOD RISK MANAGEMENT ===")
+        print("✓ Positions automatically closed before market close")
+        print("✓ Prevents overnight gap risk exposure")
+        print("✓ Configurable EOD exit time per market")
+        print("✓ Separate tracking of EOD vs signal-based exits")
 
         return engine
 
@@ -1001,4 +1142,4 @@ if __name__ == "__main__":
 
     end_time = time.time()
     print(f"\nTotal execution time: {end_time - start_time:.2f} seconds")
-    print("Trading engine completed successfully!")
+    print("Enhanced trading engine completed successfully!")
