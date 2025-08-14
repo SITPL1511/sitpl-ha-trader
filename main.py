@@ -94,7 +94,7 @@ class TradingConfig:
         """Detect market based on symbol suffix"""
         if symbol.endswith('.NS') or symbol.endswith('.BO'):
             return 'NSE'
-        elif any(symbol.endswith(suffix) for suffix in ['.L', '.TO', '.AX']):
+        elif any(symbol.endswith(suffix) for suffix in ['.L', '.TO', '.AX', '-USD']):
             return 'OTHER'
         else:
             return 'NSE'  # Default for US stocks
@@ -1068,7 +1068,7 @@ def main():
     config.polygon_key = "demo"        # Replace with your free Polygon API key
 
     # Configure for Indian market
-    config.symbols = ['^NSEBANK']  # Indian stock symbol
+    config.symbols = ['MAZDOCK.NS']  # Indian stock symbol
     config.timeframe = '15m'
     config.concurrent_downloads = False
     config.enable_eod_closure = True  # Enable EOD position closure
