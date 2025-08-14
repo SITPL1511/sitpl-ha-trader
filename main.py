@@ -711,7 +711,7 @@ class SignalGenerator:
                             symbol=symbol,
                             signal_type='LONG',
                             entry_price=round(data.iloc[i]['Close'], 4),
-                            stop_loss=round(data.iloc[i]['Open'], 4),
+                            stop_loss=min(round(data.iloc[i]['Open'], 4), round(data.iloc[i]['HA_Open'], 4)),
                             ha_close=round(data.iloc[i]['HA_Close'], 4),
                             ha_open=round(data.iloc[i]['HA_Open'], 4),
                             regular_close=round(data.iloc[i]['Close'], 4),
@@ -724,7 +724,7 @@ class SignalGenerator:
                             symbol=symbol,
                             signal_type='SHORT',
                             entry_price=round(data.iloc[i]['Close'], 4),
-                            stop_loss=round(data.iloc[i]['Open'], 4),
+                            stop_loss=max(round(data.iloc[i]['Open'], 4), round(data.iloc[i]['HA_Open'], 4)),
                             ha_close=round(data.iloc[i]['HA_Close'], 4),
                             ha_open=round(data.iloc[i]['HA_Open'], 4),
                             regular_close=round(data.iloc[i]['Close'], 4),
@@ -1068,8 +1068,8 @@ def main():
     config.polygon_key = "demo"        # Replace with your free Polygon API key
 
     # Configure for Indian market
-    config.symbols = ['^NSEI']  # Indian stock symbol
-    config.timeframe = '5m'
+    config.symbols = ['^NSEBANK']  # Indian stock symbol
+    config.timeframe = '15m'
     config.concurrent_downloads = False
     config.enable_eod_closure = True  # Enable EOD position closure
 
