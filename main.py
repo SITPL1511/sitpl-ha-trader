@@ -50,7 +50,7 @@ class TradingConfig:
         self.timeframe = '5m'  # 1m, 5m, 15m, 1h, 1d
         self.position_size = 1000  # USD per trade
         self.max_positions = 5
-        self.risk_per_trade = 0.02  # 2% risk per trade
+        self.risk_per_trade = 0.03  # 3% risk per trade
         self.data_lookback_days = 252
         self.price_tolerance = 0.001  # 0.1% for open=low/high detection
         self.concurrent_downloads = True
