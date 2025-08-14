@@ -85,7 +85,7 @@ class TradingConfig:
 
         # API Keys for alternative data sources
         self.alpha_vantage_key = "GFAICALUQMRA3RBJ"
-        self.polygon_key = "demo"
+        self.polygon_key = "2elJe1MBvogj0rVlx0v4NstAGeL0VoW9"
 
         # Data source preference order
         self.data_sources = ['alpha_vantage', 'polygon', 'yahoo_direct', 'yfinance']
