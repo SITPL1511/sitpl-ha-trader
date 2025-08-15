@@ -20,7 +20,7 @@ class TradeSignal:
     """Trade signal data structure"""
     timestamp: datetime
     symbol: str
-    signal_type: str  # 'LONG', 'SHORT', 'EXIT_LONG', 'EXIT_SHORT', 'EOD_EXIT'
+    signal_type: str  # 'LONG', 'SHORT', 'EXIT_LONG', 'EXIT_SHORT', 'EOD_EXIT', 'STOP_LOSS'
     entry_price: float
     stop_loss: float
     ha_close: float
@@ -659,7 +659,7 @@ class HeikinAshiCalculator:
         return data
 
 class SignalGenerator:
-    """Generates trading signals based on Heikin Ashi patterns with EOD logic"""
+    """Generates trading signals based on Heikin Ashi patterns with EOD and Stop Loss logic"""
 
     def __init__(self, config: TradingConfig):
         self.config = config
@@ -667,7 +667,7 @@ class SignalGenerator:
         self.logger = logging.getLogger(__name__)
 
     def generate_signals(self, data: pd.DataFrame, symbol: str) -> List[TradeSignal]:
-        """Generate trading signals from Heikin Ashi data with EOD exits"""
+        """Generate trading signals from Heikin Ashi data with EOD exits and stop loss checks"""
         signals = []
 
         if len(data) < 2:
@@ -698,6 +698,8 @@ class SignalGenerator:
         # Generate signals
         for i in range(1, len(data)):
             timestamp = data.iloc[i]['Datetime'] if 'Datetime' in data.columns else data.index[i]
+            current_low = data.iloc[i]['Low']
+            current_high = data.iloc[i]['High']
 
             # Only generate entry signals during market hours
             if self.time_manager.is_market_open(timestamp, symbol):
@@ -730,6 +732,22 @@ class SignalGenerator:
                             regular_close=round(data.iloc[i]['Close'], 4),
                             regular_open=round(data.iloc[i]['Open'], 4)
                         ))
+
+            # Stop Loss check signals - these can happen anytime during market hours
+            if self.time_manager.is_market_open(timestamp, symbol):
+                # For LONG positions: stop loss triggered if low breaches stop loss
+                # For SHORT positions: stop loss triggered if high breaches stop loss
+                signals.append(TradeSignal(
+                    timestamp=timestamp,
+                    symbol=symbol,
+                    signal_type='STOP_LOSS',
+                    entry_price=round(data.iloc[i]['Close'], 4),
+                    stop_loss=0.0000,
+                    ha_close=round(data.iloc[i]['HA_Close'], 4),
+                    ha_open=round(data.iloc[i]['HA_Open'], 4),
+                    regular_close=round(data.iloc[i]['Close'], 4),
+                    regular_open=round(data.iloc[i]['Open'], 4)
+                ))
 
             # Regular exit signals (HA color change)
             if green_to_red.iloc[i]:
@@ -789,6 +807,7 @@ class TradingEngine:
 
         # EOD tracking
         self.eod_closures = []
+        self.stop_loss_hits = []
 
         # Setup logging
         self.setup_logging()
@@ -830,8 +849,13 @@ class TradingEngine:
 
         # Process each symbol
         all_signals = []
+        price_data = {}  # Store price data for stop loss checking
+
         for symbol, data in data_dict.items():
             self.logger.info(f"Processing {symbol} - Market: {self.config.detect_market(symbol)}")
+
+            # Store price data for stop loss checking
+            price_data[symbol] = data
 
             # Calculate Heikin Ashi
             ha_data = HeikinAshiCalculator.calculate(data)
@@ -847,9 +871,9 @@ class TradingEngine:
 
         self.logger.info(f"Total signals generated: {len(all_signals)}")
 
-        # Execute trades
+        # Execute trades with stop loss checking
         for signal in all_signals:
-            self._process_signal(signal)
+            self._process_signal(signal, price_data)
 
         # Force close any remaining open positions at the end
         self._close_all_positions_at_end()
@@ -863,6 +887,7 @@ class TradingEngine:
         self.logger.info(f"Backtest completed in {execution_time:.2f} seconds")
         self.logger.info(f"Total trades: {len(self.trades)}")
         self.logger.info(f"EOD closures: {len(self.eod_closures)}")
+        self.logger.info(f"Stop loss hits: {len(self.stop_loss_hits)}")
 
         return {
             'trades': self.trades,
@@ -871,10 +896,11 @@ class TradingEngine:
             'total_signals': len(all_signals),
             'data_sources_used': list(data_dict.keys()),
             'eod_closures': len(self.eod_closures),
+            'stop_loss_hits': len(self.stop_loss_hits),
             'timezone': 'Asia/Kolkata (IST)'
         }
 
-    def _process_signal(self, signal: TradeSignal):
+    def _process_signal(self, signal: TradeSignal, price_data: Dict[str, pd.DataFrame]):
         """Process individual trading signal with EOD logic"""
         symbol = signal.symbol
 
@@ -925,10 +951,62 @@ class TradingEngine:
                     'side': trade.side
                 })
 
+        elif signal.signal_type == 'STOP_LOSS':
+            # Check stop loss for existing positions
+            if symbol in self.open_positions and symbol in price_data:
+                trade = self.open_positions[symbol]
+                current_data = price_data[symbol]
+                
+                # Find the current bar for stop loss check
+                current_bar = None
+                for _, row in current_data.iterrows():
+                    if 'Datetime' in current_data.columns:
+                        bar_time = row['Datetime']
+                    else:
+                        bar_time = row.name
+                    
+                    if bar_time == signal.timestamp:
+                        current_bar = row
+                        break
+                
+                if current_bar is not None:
+                    stop_loss_hit = False
+                    
+                    if trade.side == 'LONG':
+                        # Long position: stop loss triggered if low breaches stop loss
+                        if current_bar['Low'] <= trade.stop_loss:
+                            stop_loss_hit = True
+                    else:  # SHORT position
+                        # Short position: stop loss triggered if high breaches stop loss
+                        if current_bar['High'] >= trade.stop_loss:
+                            stop_loss_hit = True
+                    
+                    if stop_loss_hit:
+                        # Create exit signal with stop loss price
+                        exit_signal = TradeSignal(
+                            timestamp=signal.timestamp,
+                            symbol=symbol,
+                            signal_type='STOP_LOSS_EXIT',
+                            entry_price=trade.stop_loss,  # Exit at stop loss price
+                            stop_loss=0.0000,
+                            ha_close=signal.ha_close,
+                            ha_open=signal.ha_open,
+                            regular_close=signal.regular_close,
+                            regular_open=signal.regular_open
+                        )
+                        
+                        self._close_position(trade, exit_signal, 'STOP_LOSS')
+                        self.stop_loss_hits.append({
+                            'symbol': symbol,
+                            'timestamp': signal.timestamp,
+                            'side': trade.side,
+                            'stop_loss_price': trade.stop_loss
+                        })
+
     def _close_position(self, trade: Trade, signal: TradeSignal, reason: str):
         """Close a position and calculate P&L"""
         trade.exit_time = signal.timestamp
-        trade.exit_price = round(signal.entry_price, 4)  # Using regular chart price
+        trade.exit_price = round(signal.entry_price, 4)  # Using signal price
         trade.exit_reason = reason
         trade.status = 'CLOSED'
 
@@ -982,6 +1060,7 @@ class TradingEngine:
         durations = []
         eod_trades = 0
         ha_exit_trades = 0
+        stop_loss_trades = 0
 
         for trade in closed_trades:
             if trade.entry_time and trade.exit_time:
@@ -992,6 +1071,8 @@ class TradingEngine:
                     eod_trades += 1
                 elif trade.exit_reason == 'HA_COLOR_CHANGE':
                     ha_exit_trades += 1
+                elif trade.exit_reason == 'STOP_LOSS':
+                    stop_loss_trades += 1
 
         metrics = {
             'total_trades': len(closed_trades),
@@ -1007,6 +1088,7 @@ class TradingEngine:
             'average_trade_duration_hours': round(np.mean(durations), 4) if durations else 0.0000,
             'eod_closures': eod_trades,
             'ha_color_exits': ha_exit_trades,
+            'stop_loss_exits': stop_loss_trades,
             'timezone': 'Asia/Kolkata (IST)'
         }
 
@@ -1068,7 +1150,7 @@ def main():
     config.polygon_key = "demo"        # Replace with your free Polygon API key
 
     # Configure for Indian market
-    config.symbols = ['MAZDOCK.NS']  # Indian stock symbol
+    config.symbols = ['BDL.NS']  # Indian stock symbol
     config.timeframe = '15m'
     config.concurrent_downloads = False
     config.enable_eod_closure = True  # Enable EOD position closure
@@ -1111,6 +1193,7 @@ def main():
             print(f"Average Trade Duration: {performance.get('average_trade_duration_hours', 0):.4f} hours")
             print(f"EOD Closures: {performance.get('eod_closures', 0)}")
             print(f"HA Color Change Exits: {performance.get('ha_color_exits', 0)}")
+            print(f"Stop Loss Exits: {performance.get('stop_loss_exits', 0)}")
         else:
             print("No completed trades found.")
 
@@ -1119,11 +1202,12 @@ def main():
             engine.export_trades()
             print(f"\nTrade history exported to CSV with IST timestamps")
 
-        print("\n=== EOD RISK MANAGEMENT ===")
-        print("✓ Positions automatically closed before market close")
-        print("✓ Prevents overnight gap risk exposure")
+        print("\n=== RISK MANAGEMENT FEATURES ===")
+        print("✓ Stop Loss: Positions closed when SL price is breached")
+        print("✓ EOD Closure: Positions closed before market close")
+        print("✓ HA Signal Exits: Positions closed on Heikin Ashi color change")
         print("✓ Configurable EOD exit time per market")
-        print("✓ Separate tracking of EOD vs signal-based exits")
+        print("✓ Separate tracking of all exit types")
 
         return engine
 
@@ -1142,4 +1226,4 @@ if __name__ == "__main__":
 
     end_time = time.time()
     print(f"\nTotal execution time: {end_time - start_time:.2f} seconds")
-    print("Enhanced trading engine completed successfully!")
+    print("Enhanced trading engine with Stop Loss completed successfully!")
