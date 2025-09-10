@@ -57,7 +57,7 @@ class TradingConfig:
         self.polygon_key: str = "2elJe1MBvogj0rVlx0v4NstAGeL0VoW9"
 
         # Data source preference order
-        self.data_sources: List[str] = ['alpha_vantage', 'polygon', 'yahoo_direct', 'yfinance']
+        self.data_sources: List[str] = ['yahoo_direct', 'yfinance', 'alpha_vantage', 'polygon']
 
         # File paths
         self.logs_dir: str = "logs"
