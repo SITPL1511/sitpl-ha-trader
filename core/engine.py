@@ -9,7 +9,7 @@ from typing import List, Dict, Optional
 
 from config import TradingConfig
 from core.models import Trade, TradeSignal, PerformanceMetrics
-from data.signals import SignalGenerator, SignalFilter
+from core.signals import SignalGenerator, SignalFilter
 from data.manager import DataManager
 from data.indicators import HeikinAshiCalculator
 from utils.time_manager import TimeManager
@@ -463,7 +463,6 @@ class EngineFactory:
     @staticmethod
     def create_engine_with_symbols(symbols: List[str], timeframe: str = '5m') -> TradingEngine:
         """Create engine with specific symbols and timeframe"""
-        from config import config as default_config
 
         # Create a copy of config
         custom_config = TradingConfig()
