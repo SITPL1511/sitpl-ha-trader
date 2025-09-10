@@ -74,13 +74,17 @@ class SignalGenerator(LoggerMixin):
         long_cond1 = prev_ha_color == 'GREEN'
         long_cond2 = data['HA_Close'] > data['HA_Close'].shift(1)
         long_cond3 = np.abs(data['HA_Open'] - data['HA_Low']) < (data['HA_High'] - data['HA_Low']) * self.config.price_tolerance
-        long_entries = long_cond1 & long_cond2 & long_cond3
+        long_cond4 = data['HA_Close'] - data['HA_Open'] > data['HA_Open'] - data['HA_Low']
+        long_cond5 = data['ADX'] > 21
+        long_entries = long_cond1 & long_cond2 & long_cond3 & long_cond4 & long_cond5
 
         # Short entry conditions
         short_cond1 = prev_ha_color == 'RED'
         short_cond2 = np.abs(data['HA_Open'] - data['HA_High']) < (data['HA_High'] - data['HA_Low']) * self.config.price_tolerance
         short_cond3 = data['HA_Close'] < data['HA_Close'].shift(1)
-        short_entries = short_cond1 & short_cond2 & short_cond3
+        short_cond4 = data['HA_Open'] - data['HA_Close'] > data['HA_High'] - data['HA_Open']
+        short_cond5 = data['ADX'] > 21
+        short_entries = short_cond1 & short_cond2 & short_cond3 & short_cond4 & short_cond5
 
         # Generate entry signals
         for i in range(1, len(data)):

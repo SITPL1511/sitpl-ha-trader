@@ -9,11 +9,21 @@ import logging
 
 
 class HeikinAshiCalculator:
-    """High-performance Heikin Ashi calculations using vectorized operations"""
+    """High-performance Heikin Ashi calculations using vectorized operations with ADX integration"""
 
     @staticmethod
-    def calculate(df: pd.DataFrame) -> Optional[pd.DataFrame]:
-        """Calculate Heikin Ashi values using vectorized operations"""
+    def calculate(df: pd.DataFrame, include_adx: bool = True, adx_period: int = 14) -> Optional[pd.DataFrame]:
+        """
+        Calculate Heikin Ashi values using vectorized operations and optionally include ADX
+
+        Args:
+            df: DataFrame with OHLC data
+            include_adx: Whether to calculate ADX indicators (default True)
+            adx_period: Period for ADX calculation (default 14)
+
+        Returns:
+            DataFrame with Heikin Ashi and optionally ADX data
+        """
         logger = logging.getLogger(__name__)
 
         if df is None or df.empty:
@@ -52,25 +62,168 @@ class HeikinAshiCalculator:
             ha_high = np.maximum.reduce([data['High'], ha_open, ha_close])
             ha_low = np.minimum.reduce([data['Low'], ha_open, ha_close])
 
-            # Add to dataframe
+            # Add Heikin Ashi columns to dataframe
             data['HA_Open'] = ha_open
             data['HA_High'] = ha_high
             data['HA_Low'] = ha_low
             data['HA_Close'] = ha_close
             data['HA_Color'] = np.where(ha_close >= ha_open, 'GREEN', 'RED')
 
-            logger.debug(f"Calculated Heikin Ashi for {n} bars")
+            # Calculate ADX if requested
+            if include_adx:
+                adx_data = TechnicalIndicators.adx(
+                    high=data['High'],
+                    low=data['Low'],
+                    close=data['Close'],
+                    period=adx_period
+                )
+
+                # Add ADX columns to the data
+                data['ADX'] = adx_data['adx']
+                data['DI_Plus'] = adx_data['di_plus']
+                data['DI_Minus'] = adx_data['di_minus']
+
+                # Add trend strength classification
+                data['ADX_Trend_Strength'] = data['ADX'].apply(TechnicalIndicators.adx_trend_strength)
+
+                # Add trading signals
+                signals = TechnicalIndicators.adx_signals(adx_data)
+                data['ADX_Signal'] = signals
+
+                logger.debug(f"Calculated Heikin Ashi and ADX for {n} bars")
+            else:
+                logger.debug(f"Calculated Heikin Ashi for {n} bars")
+
             return data
 
         except Exception as e:
-            logger.error(f"Error calculating Heikin Ashi: {e}")
+            logger.error(f"Error calculating Heikin Ashi and ADX: {e}")
             return df
+
+    @staticmethod
+    def calculate_with_enhanced_adx(df: pd.DataFrame, adx_period: int = 14,
+                                    adx_threshold: float = 25.0) -> Optional[pd.DataFrame]:
+        """
+        Calculate Heikin Ashi with enhanced ADX analysis including trend momentum
+
+        Args:
+            df: DataFrame with OHLC data
+            adx_period: Period for ADX calculation
+            adx_threshold: Threshold for strong trend identification
+
+        Returns:
+            DataFrame with Heikin Ashi, ADX, and enhanced trend analysis
+        """
+        logger = logging.getLogger(__name__)
+
+        # First calculate basic HA and ADX
+        data = HeikinAshiCalculator.calculate(df, include_adx=True, adx_period=adx_period)
+
+        if data is None:
+            return data
+
+        try:
+            # Enhanced ADX analysis
+            # ADX momentum (rate of change)
+            data['ADX_Momentum'] = data['ADX'].diff()
+            data['ADX_Rising'] = data['ADX_Momentum'] > 0
+
+            # DI crossover signals
+            data['DI_Crossover'] = np.where(
+                (data['DI_Plus'] > data['DI_Minus']) &
+                (data['DI_Plus'].shift(1) <= data['DI_Minus'].shift(1)),
+                'BULLISH_CROSS',
+                np.where(
+                    (data['DI_Minus'] > data['DI_Plus']) &
+                    (data['DI_Minus'].shift(1) <= data['DI_Plus'].shift(1)),
+                    'BEARISH_CROSS',
+                    'NO_CROSS'
+                )
+            )
+
+            # Combined HA and ADX signals
+            strong_trend = data['ADX'] >= adx_threshold
+            adx_rising = data['ADX_Rising'] == True
+            ha_bullish = data['HA_Color'] == 'GREEN'
+            ha_bearish = data['HA_Color'] == 'RED'
+            di_bullish = data['DI_Plus'] > data['DI_Minus']
+            di_bearish = data['DI_Minus'] > data['DI_Plus']
+
+            # Enhanced signal generation
+            data['HA_ADX_Signal'] = np.select([
+                strong_trend & adx_rising & ha_bullish & di_bullish,
+                strong_trend & adx_rising & ha_bearish & di_bearish,
+                strong_trend & ha_bullish & di_bullish,
+                strong_trend & ha_bearish & di_bearish,
+                ~strong_trend
+            ], [
+                'STRONG_LONG',
+                'STRONG_SHORT',
+                'LONG',
+                'SHORT',
+                'NO_TREND'
+            ], default='NEUTRAL')
+
+            # Trend quality score (0-100)
+            data['Trend_Quality'] = np.where(
+                strong_trend,
+                np.minimum(100, data['ADX'] +
+                           np.where(adx_rising, 10, 0) +
+                           np.where(ha_bullish == di_bullish, 15, 0)),
+                0
+            )
+
+            logger.debug(f"Calculated enhanced Heikin Ashi and ADX analysis for {len(data)} bars")
+            return data
+
+        except Exception as e:
+            logger.error(f"Error in enhanced ADX calculation: {e}")
+            return data
 
     @staticmethod
     def validate_ha_data(df: pd.DataFrame) -> bool:
         """Validate that DataFrame contains proper Heikin Ashi data"""
         required_ha_columns = ['HA_Open', 'HA_High', 'HA_Low', 'HA_Close', 'HA_Color']
         return all(col in df.columns for col in required_ha_columns)
+
+    @staticmethod
+    def validate_adx_data(df: pd.DataFrame) -> bool:
+        """Validate that DataFrame contains proper ADX data"""
+        required_adx_columns = ['ADX', 'DI_Plus', 'DI_Minus']
+        return all(col in df.columns for col in required_adx_columns)
+
+    @staticmethod
+    def get_latest_signals(df: pd.DataFrame) -> dict:
+        """
+        Get the latest HA and ADX signals from the DataFrame
+
+        Returns:
+            Dictionary with latest signal information
+        """
+        if df is None or df.empty:
+            return {}
+
+        latest = df.iloc[-1]
+
+        signals = {
+            'ha_color': latest.get('HA_Color', 'N/A'),
+            'adx_value': latest.get('ADX', 0),
+            'adx_trend_strength': latest.get('ADX_Trend_Strength', 'N/A'),
+            'adx_signal': latest.get('ADX_Signal', 'N/A'),
+            'di_plus': latest.get('DI_Plus', 0),
+            'di_minus': latest.get('DI_Minus', 0)
+        }
+
+        # Add enhanced signals if available
+        if 'HA_ADX_Signal' in df.columns:
+            signals.update({
+                'ha_adx_signal': latest.get('HA_ADX_Signal', 'N/A'),
+                'trend_quality': latest.get('Trend_Quality', 0),
+                'adx_rising': latest.get('ADX_Rising', False),
+                'di_crossover': latest.get('DI_Crossover', 'NO_CROSS')
+            })
+
+        return signals
 
 
 class MovingAverages:
@@ -226,7 +379,9 @@ class TechnicalIndicators:
         Returns:
             String description of trend strength
         """
-        if adx_value < 25:
+        if pd.isna(adx_value):
+            return "No Data"
+        elif adx_value < 25:
             return "Weak/No Trend"
         elif adx_value < 50:
             return "Strong Trend"
