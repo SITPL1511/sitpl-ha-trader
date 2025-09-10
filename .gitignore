@@ -1,0 +1,8 @@
+.idea
+logs
+*.csv
+**/*.csv
+**/*.log
+**/*.json
+*.log
+*.json
